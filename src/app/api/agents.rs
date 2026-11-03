@@ -887,7 +887,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_focus_marks_already_focused_done_agent_seen() {
+    fn agent_focus_marks_already_focused_done_agent_seen_after_delay() {
         let mut app = app_with_agent();
         app.state.outer_terminal_focus = Some(false);
 
@@ -918,7 +918,11 @@ mod tests {
         let ResponseResult::AgentInfo { agent } = success.result else {
             panic!("expected agent info response");
         };
-        assert_eq!(agent.agent_status, AgentStatus::Idle);
+        assert_eq!(agent.agent_status, AgentStatus::Done);
+
+        let deadline = app.state.next_pending_tab_seen_deadline().unwrap();
+        assert!(app.state.mark_due_tab_seen(deadline));
+        assert!(app.state.workspaces[0].tabs[0].panes[&pane_id].seen);
     }
 
     #[test]

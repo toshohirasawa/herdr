@@ -737,6 +737,16 @@ pub struct PendingAgentNotification {
     pub deadline: std::time::Instant,
 }
 
+/// How long a tab must stay visible before its panes count as seen.
+pub const TAB_SEEN_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingTabSeen {
+    pub workspace_id: String,
+    pub root_pane: PaneId,
+    pub deadline: std::time::Instant,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentNotificationDelivery {
     pub pane_id: PaneId,
@@ -816,6 +826,7 @@ pub struct AppState {
     pub config_diagnostic: Option<String>,
     pub toast: Option<ToastNotification>,
     pub pending_agent_notifications: std::collections::HashMap<PaneId, PendingAgentNotification>,
+    pub pending_tab_seen: Option<PendingTabSeen>,
     /// Last reported focus state for the outer terminal hosting herdr.
     /// None means unsupported or not yet reported, which preserves active-pane suppression.
     pub outer_terminal_focus: Option<bool>,
@@ -1060,6 +1071,7 @@ impl AppState {
             config_diagnostic: None,
             toast: None,
             pending_agent_notifications: std::collections::HashMap::new(),
+            pending_tab_seen: None,
             outer_terminal_focus: None,
             prefix_keys: vec![(KeyCode::Char('b'), KeyModifiers::CONTROL)],
             headless_size: (

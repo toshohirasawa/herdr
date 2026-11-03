@@ -16,7 +16,7 @@ use crate::workspace::WorkspaceGitStatus;
 use super::api_helpers::pane_agent_status;
 use super::state::{
     AgentNotificationDelivery, AppState, Mode, PaneFocusTarget, PendingAgentNotification,
-    ToastKind, ToastNotification, ToastTarget,
+    PendingTabSeen, ToastKind, ToastNotification, ToastTarget, TAB_SEEN_DELAY,
 };
 
 fn is_background_completion_transition(prev_state: AgentState, new_state: AgentState) -> bool {
@@ -399,6 +399,7 @@ impl AppState {
                     public_tab_id_for_index(ws, active_tab).unwrap_or_else(|| workspace_id.clone());
                 crate::logging::tab_focused(&workspace_id, &tab_id);
             }
+            self.schedule_active_tab_seen();
             self.record_pane_focus_after_navigation(previous_focus);
         }
     }
@@ -430,6 +431,7 @@ impl AppState {
                 public_tab_id_for_index(ws, tab_idx).unwrap_or_else(|| workspace_id.clone());
             crate::logging::tab_focused(&workspace_id, &tab_id);
         }
+        self.schedule_active_tab_seen();
         self.record_pane_focus_after_navigation(previous_focus);
         true
     }
@@ -446,8 +448,63 @@ impl AppState {
             let tab_id = public_tab_id_for_index(ws, idx).unwrap_or_else(|| workspace_id.clone());
             crate::logging::tab_focused(&workspace_id, &tab_id);
             self.mark_session_dirty();
+            self.schedule_active_tab_seen();
             self.record_pane_focus_after_navigation(previous_focus);
         }
+    }
+
+    fn active_tab_seen_target(&self) -> Option<(String, PaneId)> {
+        let ws = self.workspaces.get(self.active?)?;
+        Some((ws.id.clone(), ws.active_tab()?.root_pane))
+    }
+
+    /// Marks the active tab seen once it has stayed visible for `TAB_SEEN_DELAY`,
+    /// so tabs that are only passed through while navigating stay unread.
+    pub(crate) fn schedule_active_tab_seen(&mut self) {
+        self.schedule_active_tab_seen_at(std::time::Instant::now());
+    }
+
+    pub(crate) fn schedule_active_tab_seen_at(&mut self, now: std::time::Instant) {
+        let Some((workspace_id, root_pane)) = self.active_tab_seen_target() else {
+            self.pending_tab_seen = None;
+            return;
+        };
+        if self.pending_tab_seen.as_ref().is_some_and(|pending| {
+            pending.workspace_id == workspace_id && pending.root_pane == root_pane
+        }) {
+            return;
+        }
+        self.pending_tab_seen = Some(PendingTabSeen {
+            workspace_id,
+            root_pane,
+            deadline: now + TAB_SEEN_DELAY,
+        });
+    }
+
+    pub(crate) fn cancel_pending_tab_seen(&mut self) {
+        self.pending_tab_seen = None;
+    }
+
+    pub fn next_pending_tab_seen_deadline(&self) -> Option<std::time::Instant> {
+        self.pending_tab_seen
+            .as_ref()
+            .map(|pending| pending.deadline)
+    }
+
+    /// Marks the scheduled tab seen if it is due and still active. Losing outer
+    /// terminal focus cancels the schedule instead, so focus from other clients
+    /// (API, mobile) still marks the tab seen while the terminal is unfocused.
+    pub fn mark_due_tab_seen(&mut self, now: std::time::Instant) -> bool {
+        let Some(pending) = self
+            .pending_tab_seen
+            .take_if(|pending| pending.deadline <= now)
+        else {
+            return false;
+        };
+        if self.active_tab_seen_target() != Some((pending.workspace_id, pending.root_pane)) {
+            return false;
+        }
+        self.mark_active_tab_seen()
     }
 
     pub(crate) fn mark_active_tab_seen(&mut self) -> bool {
@@ -2763,14 +2820,62 @@ mod tests {
     }
 
     #[test]
-    fn switch_workspace_marks_panes_seen() {
+    fn switch_workspace_marks_panes_seen_after_delay() {
         let mut state = app_with_workspaces(&["a", "b"]);
         // Mark a pane in workspace 1 as unseen
         let id = *state.workspaces[1].panes.keys().next().unwrap();
         state.workspaces[1].panes.get_mut(&id).unwrap().seen = false;
 
         state.switch_workspace(1);
+        assert!(!state.workspaces[1].panes.get(&id).unwrap().seen);
+
+        let deadline = state.next_pending_tab_seen_deadline().unwrap();
+        assert!(!state.mark_due_tab_seen(deadline - std::time::Duration::from_millis(1)));
+        assert!(!state.workspaces[1].panes.get(&id).unwrap().seen);
+
+        assert!(state.mark_due_tab_seen(deadline));
         assert!(state.workspaces[1].panes.get(&id).unwrap().seen);
+        assert_eq!(state.next_pending_tab_seen_deadline(), None);
+    }
+
+    #[test]
+    fn leaving_workspace_before_delay_keeps_panes_unseen() {
+        let mut state = app_with_workspaces(&["a", "b"]);
+        let id = *state.workspaces[1].panes.keys().next().unwrap();
+        state.workspaces[1].panes.get_mut(&id).unwrap().seen = false;
+
+        state.switch_workspace(1);
+        state.switch_workspace(0);
+        let deadline = state.next_pending_tab_seen_deadline().unwrap();
+        state.mark_due_tab_seen(deadline);
+
+        assert!(!state.workspaces[1].panes.get(&id).unwrap().seen);
+    }
+
+    #[test]
+    fn rescheduling_same_tab_keeps_original_deadline() {
+        let mut state = app_with_workspaces(&["a", "b"]);
+        let now = std::time::Instant::now();
+        state.switch_workspace(1);
+        state.schedule_active_tab_seen_at(now);
+        let deadline = state.next_pending_tab_seen_deadline().unwrap();
+
+        state.schedule_active_tab_seen_at(now + TAB_SEEN_DELAY);
+        assert_eq!(state.next_pending_tab_seen_deadline(), Some(deadline));
+    }
+
+    #[test]
+    fn cancelled_tab_seen_does_not_mark_tab_seen() {
+        let mut state = app_with_workspaces(&["a", "b"]);
+        let id = *state.workspaces[1].panes.keys().next().unwrap();
+        state.workspaces[1].panes.get_mut(&id).unwrap().seen = false;
+
+        state.switch_workspace(1);
+        let deadline = state.next_pending_tab_seen_deadline().unwrap();
+        state.cancel_pending_tab_seen();
+
+        assert!(!state.mark_due_tab_seen(deadline));
+        assert!(!state.workspaces[1].panes.get(&id).unwrap().seen);
     }
 
     #[test]

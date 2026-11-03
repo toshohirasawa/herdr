@@ -837,13 +837,18 @@ impl HeadlessServer {
 
         self.effective_size = terminal_size;
         self.sync_runtime_view_geometry();
+        let previous_outer_terminal_focus = self.app.state.outer_terminal_focus;
         self.app.state.outer_terminal_focus = outer_terminal_focus;
         self.app.state.host_cell_size = host_cell_size;
         let server_keybindings = self.server_keybindings.clone();
         apply_keybindings(&mut self.app, &server_keybindings);
         self.sync_visible_server_config_diagnostic(false);
-        if outer_terminal_focus == Some(true) {
-            self.app.state.mark_active_tab_seen();
+        match outer_terminal_focus {
+            Some(true) => self.app.state.schedule_active_tab_seen(),
+            Some(false) if previous_outer_terminal_focus != Some(false) => {
+                self.app.state.cancel_pending_tab_seen()
+            }
+            _ => {}
         }
         self.app.set_host_terminal_appearance_state(
             host_terminal_appearance,
@@ -3299,6 +3304,15 @@ impl HeadlessServer {
             self.app.toast_deadline = None;
             self.app.state.toast = None;
             changed = true;
+        }
+
+        if self
+            .app
+            .state
+            .next_pending_tab_seen_deadline()
+            .is_some_and(|deadline| now >= deadline)
+        {
+            changed |= self.app.state.mark_due_tab_seen(now);
         }
 
         if self
