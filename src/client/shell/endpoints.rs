@@ -585,7 +585,12 @@ impl ClientShellState {
         if let Some(surface) = presented_surface {
             self.endpoints[index]
                 .agent_presentation
-                .acknowledge_surface(&mut snapshot, surface, self.outer_focused);
+                .acknowledge_surface(
+                    &mut snapshot,
+                    surface,
+                    self.outer_focused,
+                    std::time::Instant::now(),
+                );
         }
         let previous = self.endpoints[index].snapshot.as_deref();
         let mut next_recency = self
@@ -654,6 +659,31 @@ impl ClientShellState {
     }
 
     pub(crate) fn acknowledge_active_surface_agents(&mut self, surface: &PaneSurfaceFrame) -> bool {
+        self.acknowledge_active_surface_agents_at(surface, std::time::Instant::now())
+    }
+
+    /// Re-evaluates the presented surface so a pane is acknowledged when its dwell elapses,
+    /// even if no new frame or snapshot arrives.
+    pub(crate) fn tick_surface_acknowledgement(&mut self, now: std::time::Instant) -> bool {
+        let surface = self.pane_surface.take();
+        for endpoint in &mut self.endpoints {
+            if surface.is_none() || endpoint.endpoint_id != self.active_endpoint_id {
+                endpoint.agent_presentation.forget_presented_surface();
+            }
+        }
+        let Some(surface) = surface else {
+            return false;
+        };
+        let changed = self.acknowledge_active_surface_agents_at(&surface, now);
+        self.pane_surface = Some(surface);
+        changed
+    }
+
+    fn acknowledge_active_surface_agents_at(
+        &mut self,
+        surface: &PaneSurfaceFrame,
+        now: std::time::Instant,
+    ) -> bool {
         let Some(index) = self
             .endpoints
             .iter()
@@ -666,9 +696,12 @@ impl ClientShellState {
             let Some(snapshot) = endpoint.snapshot.as_deref_mut() else {
                 return false;
             };
-            endpoint
-                .agent_presentation
-                .acknowledge_surface(snapshot, surface, self.outer_focused)
+            endpoint.agent_presentation.acknowledge_surface(
+                snapshot,
+                surface,
+                self.outer_focused,
+                now,
+            )
         };
         if changed {
             self.snapshot = self.endpoints[index].snapshot.clone();

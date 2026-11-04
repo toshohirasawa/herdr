@@ -1,12 +1,17 @@
 use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use crate::api::schema::AgentStatus;
 use crate::protocol::{ClientShellAgent, ClientShellSnapshot, PaneSurfaceFrame};
+
+/// How long a pane must stay presented before this client acknowledges its completion.
+const SURFACE_ACK_DELAY: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug, Default)]
 pub(super) struct EndpointAgentPresentation {
     boot_id: Option<String>,
     acknowledged: HashMap<String, u64>,
+    presented_since: HashMap<String, Instant>,
     completed: HashMap<String, u64>,
     working: HashSet<String>,
     pending_completions: Option<(
@@ -48,6 +53,7 @@ impl EndpointAgentPresentation {
         if self.boot_id.as_deref() != Some(snapshot.boot_id.as_str()) {
             self.boot_id = Some(snapshot.boot_id.clone());
             self.acknowledged.clear();
+            self.presented_since.clear();
             self.completed.clear();
             self.working.clear();
             self.acknowledged.extend(
@@ -120,17 +126,30 @@ impl EndpointAgentPresentation {
         snapshot: &mut ClientShellSnapshot,
         surface: &PaneSurfaceFrame,
         outer_focused: Option<bool>,
+        now: Instant,
     ) -> bool {
-        if outer_focused == Some(false)
-            || self.boot_id.as_deref() != Some(surface.boot_id.as_str())
+        if outer_focused == Some(false) {
+            self.forget_presented_surface();
+            return false;
+        }
+        if self.boot_id.as_deref() != Some(surface.boot_id.as_str())
             || snapshot.boot_id != surface.boot_id
             || snapshot.revision != surface.projection_revision
         {
             return false;
         }
 
+        self.presented_since
+            .retain(|pane_id, _| surface.panes.iter().any(|pane| pane.pane_id == *pane_id));
         let mut changed = false;
         for pane in &surface.panes {
+            let presented_since = *self
+                .presented_since
+                .entry(pane.pane_id.clone())
+                .or_insert(now);
+            if now.saturating_duration_since(presented_since) < SURFACE_ACK_DELAY {
+                continue;
+            }
             let Some(agent) = snapshot
                 .agents
                 .iter()
@@ -151,6 +170,11 @@ impl EndpointAgentPresentation {
             project_aggregate_status(snapshot);
         }
         changed
+    }
+
+    /// Panes presented again later start a new dwell instead of resuming this one.
+    pub(super) fn forget_presented_surface(&mut self) {
+        self.presented_since.clear();
     }
 
     pub(super) fn seen(&self, agent: &ClientShellAgent) -> bool {
@@ -430,8 +454,90 @@ mod tests {
         let mut completed = snapshot(AgentStatus::Idle, 5, 2);
         presentation.project_snapshot(&mut completed);
 
-        assert!(presentation.acknowledge_surface(&mut completed, &surface(2), Some(true)));
+        let now = Instant::now();
+        assert!(!presentation.acknowledge_surface(&mut completed, &surface(2), Some(true), now));
+        assert_eq!(completed.agents[0].agent_status, AgentStatus::Done);
+        assert!(!presentation.acknowledge_surface(
+            &mut completed,
+            &surface(2),
+            Some(true),
+            now + SURFACE_ACK_DELAY - Duration::from_millis(1),
+        ));
+        assert!(presentation.acknowledge_surface(
+            &mut completed,
+            &surface(2),
+            Some(true),
+            now + SURFACE_ACK_DELAY,
+        ));
         assert_eq!(completed.agents[0].agent_status, AgentStatus::Idle);
+    }
+
+    #[test]
+    fn leaving_a_pane_before_the_delay_restarts_its_dwell() {
+        let mut presentation = EndpointAgentPresentation::default();
+        let mut initial = snapshot(AgentStatus::Working, 4, 1);
+        presentation.project_snapshot(&mut initial);
+        let mut completed = snapshot(AgentStatus::Idle, 5, 2);
+        presentation.project_snapshot(&mut completed);
+        let mut other_pane = surface(2);
+        other_pane.panes[0].pane_id = "other-pane".into();
+
+        let now = Instant::now();
+        presentation.acknowledge_surface(&mut completed, &surface(2), Some(true), now);
+        presentation.acknowledge_surface(&mut completed, &other_pane, Some(true), now);
+        let returned = now + SURFACE_ACK_DELAY;
+        assert!(!presentation.acknowledge_surface(
+            &mut completed,
+            &surface(2),
+            Some(true),
+            returned,
+        ));
+        assert_eq!(completed.agents[0].agent_status, AgentStatus::Done);
+        assert!(presentation.acknowledge_surface(
+            &mut completed,
+            &surface(2),
+            Some(true),
+            returned + SURFACE_ACK_DELAY,
+        ));
+    }
+
+    #[test]
+    fn completion_in_an_already_presented_pane_acknowledges_immediately() {
+        let mut presentation = EndpointAgentPresentation::default();
+        let mut initial = snapshot(AgentStatus::Working, 4, 2);
+        presentation.project_snapshot(&mut initial);
+        let now = Instant::now();
+        presentation.acknowledge_surface(&mut initial, &surface(2), Some(true), now);
+
+        let mut completed = snapshot(AgentStatus::Idle, 5, 2);
+        presentation.project_snapshot(&mut completed);
+        assert!(presentation.acknowledge_surface(
+            &mut completed,
+            &surface(2),
+            Some(true),
+            now + SURFACE_ACK_DELAY,
+        ));
+        assert_eq!(completed.agents[0].agent_status, AgentStatus::Idle);
+    }
+
+    #[test]
+    fn losing_outer_focus_restarts_the_dwell() {
+        let mut presentation = EndpointAgentPresentation::default();
+        let mut initial = snapshot(AgentStatus::Working, 4, 1);
+        presentation.project_snapshot(&mut initial);
+        let mut completed = snapshot(AgentStatus::Idle, 5, 2);
+        presentation.project_snapshot(&mut completed);
+
+        let now = Instant::now();
+        presentation.acknowledge_surface(&mut completed, &surface(2), Some(true), now);
+        presentation.acknowledge_surface(&mut completed, &surface(2), Some(false), now);
+        assert!(!presentation.acknowledge_surface(
+            &mut completed,
+            &surface(2),
+            Some(true),
+            now + SURFACE_ACK_DELAY,
+        ));
+        assert_eq!(completed.agents[0].agent_status, AgentStatus::Done);
     }
 
     #[test]
@@ -447,10 +553,13 @@ mod tests {
         viewing_client.project_snapshot(&mut completed_for_viewer);
         background_client.project_snapshot(&mut completed_for_background);
 
+        let now = Instant::now();
+        viewing_client.acknowledge_surface(&mut completed_for_viewer, &surface(2), Some(true), now);
         assert!(viewing_client.acknowledge_surface(
             &mut completed_for_viewer,
             &surface(2),
-            Some(true)
+            Some(true),
+            now + SURFACE_ACK_DELAY,
         ));
 
         assert_eq!(
@@ -471,8 +580,11 @@ mod tests {
         let mut completed = snapshot(AgentStatus::Idle, 5, 2);
         presentation.project_snapshot(&mut completed);
 
-        assert!(!presentation.acknowledge_surface(&mut completed, &surface(1), Some(true)));
-        assert!(!presentation.acknowledge_surface(&mut completed, &surface(2), Some(false)));
+        let now = Instant::now();
+        let later = now + SURFACE_ACK_DELAY;
+        presentation.acknowledge_surface(&mut completed, &surface(2), Some(true), now);
+        assert!(!presentation.acknowledge_surface(&mut completed, &surface(1), Some(true), later));
+        assert!(!presentation.acknowledge_surface(&mut completed, &surface(2), Some(false), later));
         assert_eq!(completed.agents[0].agent_status, AgentStatus::Done);
     }
 }
